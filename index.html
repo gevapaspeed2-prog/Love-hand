@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>LIVE HAND v1.0</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#090d16;color:#eef4ff;font:16px system-ui;min-height:100vh;padding:16px}
+main{max-width:620px;margin:auto}h1{font-size:25px;margin:5px 0}p{color:#aab7cc;line-height:1.4}
+.panel{background:#121b2b;border:1px solid #263750;border-radius:16px;padding:14px;margin:12px 0}
+button{background:#4c8dff;color:white;border:0;border-radius:12px;padding:13px 18px;font-weight:700;font-size:16px;width:100%}
+button:disabled{opacity:.5}#view{position:relative;width:100%;aspect-ratio:4/3;background:#000;border-radius:12px;overflow:hidden}
+video,canvas{position:absolute;width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+#status{font-weight:700;color:#ffc66d}small{color:#91a2bc}
+.row{display:flex;justify-content:space-between;gap:10px;margin-top:10px}
+.pill{background:#1d2b40;border-radius:99px;padding:7px 10px;font-size:13px}
+</style>
+</head>
+<body><main>
+<h1>✋ LIVE HAND <small>v1.0</small></h1>
+<p>Открой эту страницу в Chrome, разреши камеру и нажми «Запустить трекер». Держи одну руку в кадре.</p>
+<div class="panel">
+<div id="view"><video id="video" autoplay playsinline muted></video><canvas id="canvas"></canvas></div>
+<div class="row"><span id="status">Ожидание запуска</span><span class="pill" id="fps">0 FPS</span></div>
+</div>
+<div class="panel">
+<button id="start">Запустить трекер</button>
+<div class="row"><span class="pill" id="hand">Рука: нет</span><span class="pill" id="server">Сервер: проверка…</span></div>
+<p><small>Если браузер спросит разрешение на камеру — выбери «Разрешить». Для Roblox оставь эту страницу открытой во втором окне.</small></p>
+</div>
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+const video=document.getElementById("video"), canvas=document.getElementById("canvas"), ctx=canvas.getContext("2d");
+const statusEl=document.getElementById("status"), handEl=document.getElementById("hand"), serverEl=document.getElementById("server"), fpsEl=document.getElementById("fps");
+let landmarker=null, running=false, lastSend=0, frames=0, lastFps=performance.now();
+const DOTS=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+async function postPose(data){try{await fetch("/pose",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data),cache:"no-store"});serverEl.textContent="Сервер: подключён"}catch(e){serverEl.textContent="Сервер: ошибка"}}
+async function init(){
+ statusEl.textContent="Загрузка модели…";
+ const vision=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+ landmarker=await HandLandmarker.createFromOptions(vision,{baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",delegate:"GPU"}, runningMode:"VIDEO",numHands:1,minHandDetectionConfidence:.55,minHandPresenceConfidence:.5,minTrackingConfidence:.5});
+ const stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:"user",width:{ideal:640},height:{ideal:480},frameRate:{ideal:30,max:30}}});
+ video.srcObject=stream; await video.play(); canvas.width=640;canvas.height=480;running=true;statusEl.textContent="Ищу руку…"; loop();
+}
+function loop(){
+ if(!running)return;
+ if(video.readyState>=2){
+  const now=performance.now(); const result=landmarker.detectForVideo(video,now);
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  const hand=result.landmarks?.[0];
+  if(hand){
+   ctx.strokeStyle="#52d7ff";ctx.fillStyle="#ffffff";ctx.lineWidth=3;
+   for(const [a,b] of DOTS){ctx.beginPath();ctx.moveTo(hand[a].x*canvas.width,hand[a].y*canvas.height);ctx.lineTo(hand[b].x*canvas.width,hand[b].y*canvas.height);ctx.stroke()}
+   for(const p of hand){ctx.beginPath();ctx.arc(p.x*canvas.width,p.y*canvas.height,4,0,Math.PI*2);ctx.fill()}
+   const wrist=hand[0], middle=hand[9], index=hand[5];
+   const angle=Math.atan2(middle.y-wrist.y,middle.x-wrist.x);
+   const tips=[4,8,12,16,20], bases=[2,5,9,13,17];
+   let openness=0;for(let i=0;i<5;i++){const a=hand[tips[i]],b=hand[bases[i]];openness+=Math.hypot(a.x-b.x,a.y-b.y)}openness=Math.min(1,openness/1.05);
+   const payload={detected:true,x:1-wrist.x,y:wrist.y,angle,openness,points:hand.map(p=>({x:1-p.x,y:p.y}))};
+   if(now-lastSend>65){lastSend=now;postPose(payload)}
+   handEl.textContent="Рука: обнаружена";statusEl.textContent="Трекинг активен";
+  }else{
+   handEl.textContent="Рука: нет";statusEl.textContent="Покажи руку камере";
+   if(now-lastSend>200){lastSend=now;postPose({detected:false,x:.5,y:.5,angle:0,openness:0,points:Array.from({length:21},()=>({x:.5,y:.5}))})}
+  }
+  frames++;if(now-lastFps>1000){fpsEl.textContent=frames+" FPS";frames=0;lastFps=now}
+ }
+ requestAnimationFrame(loop);
+}
+document.getElementById("start").addEventListener("click",async e=>{
+ e.currentTarget.disabled=true;
+ try{await init();e.currentTarget.textContent="Трекер запущен"}catch(err){console.error(err);statusEl.textContent="Ошибка: "+(err.message||err);e.currentTarget.disabled=false}
+});
+fetch("/health").then(r=>r.json()).then(()=>serverEl.textContent="Сервер: готов").catch(()=>serverEl.textContent="Сервер: ошибка");
+</script></main></body></html>
