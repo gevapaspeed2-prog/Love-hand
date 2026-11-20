@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>LIVE HAND v3.3</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#090d16;color:#eef4ff;font:16px system-ui;min-height:100vh;padding:14px}
+main{max-width:650px;margin:auto}h1{font-size:25px;margin:5px 0}p{color:#aab7cc;line-height:1.4}
+.panel{background:#121b2b;border:1px solid #263750;border-radius:16px;padding:13px;margin:11px 0}
+button{background:#4c8dff;color:white;border:0;border-radius:12px;padding:13px 18px;font-weight:700;font-size:16px;width:100%}
+button:disabled{opacity:.5}#view{position:relative;width:100%;aspect-ratio:4/3;background:#000;border-radius:12px;overflow:hidden}
+video,canvas{position:absolute;width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+#status{font-weight:700;color:#ffc66d}.muted{color:#91a2bc;font-size:12px}
+.row{display:flex;justify-content:space-between;gap:8px;margin-top:10px;flex-wrap:wrap}.pill{background:#1d2b40;border-radius:99px;padding:7px 10px;font-size:13px}
+.cap{font-size:12px;color:#91a2bc;margin:10px 0 5px}
+.seg{display:flex;gap:6px;margin-bottom:4px}.seg button{background:#1d2b40;color:#aab7cc;padding:11px 6px;font-size:14px;transition:background .2s,color .2s}.seg button.on{background:#4c8dff;color:#fff}
+input[type=range]{width:100%;margin:8px 0 0}label{font-size:14px;display:flex;justify-content:space-between}
+</style>
+</head>
+<body><main>
+<h1>✋ LIVE HAND <small class="muted">v3.3 · WEBSOCKET</small></h1>
+<div class="panel">
+<div id="view"><video id="video" autoplay playsinline muted></video><canvas id="canvas"></canvas></div>
+<div class="row"><span id="status">Ожидание запуска</span><span class="pill" id="fps">0 FPS</span></div>
+</div>
+<div class="panel">
+<div class="cap">Режим</div>
+<div class="seg"><button id="m1">1 рука</button><button id="m2" class="on">2 руки</button></div>
+<div id="sideRow" style="display:none">
+<div class="cap">Какая рука (для режима «1 рука»)</div>
+<div class="seg"><button id="sA" class="on">Любая</button><button id="sL">Левая</button><button id="sR">Правая</button></div>
+</div>
+<div class="cap">Камера</div>
+<div class="seg"><button id="cF" class="on">Фронтальная</button><button id="cB">Основная</button></div>
+<div class="seg" style="margin-top:6px"><button id="mir" class="on">Зеркало: вкл</button><button id="swap">Лев/прав: обычно</button></div>
+<button id="start" style="margin-top:10px">Запустить трекер</button>
+<div class="row"><span class="pill" id="hands">Руки: 0 / 2</span><span class="pill" id="server">Сервер: проверка…</span><span class="pill" id="lat">Пинг: –</span></div>
+<label style="margin-top:14px"><span>Усиление света</span><span id="gainv">1.0×</span></label>
+<input type="range" id="gain" min="1" max="2.8" step="0.1" value="1">
+<label style="margin-top:10px"><span>Удержание руки при потере</span><span id="gracev">300 мс</span></label>
+<input type="range" id="grace" min="0" max="600" step="50" value="300">
+<p class="muted">Удержание: если при быстром движении рука пропала из кадра, трекер ещё столько-то мс продолжает отправлять её последнее положение. Не сворачивай Chrome: Android может остановить камеру в фоне.</p>
+</div>
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+const $=id=>document.getElementById(id);
+const video=$("video"),canvas=$("canvas"),ctx=canvas.getContext("2d",{alpha:true});
+const statusEl=$("status"),handsEl=$("hands"),serverEl=$("server"),fpsEl=$("fps"),latEl=$("lat");
+const WIDTH=480,HEIGHT=360;
+let landmarker=null,stream=null,running=false,frames=0,lastFps=performance.now(),lastTs=0,lastEmptySend=0;
+const LINKS=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+// ---------- настройки (сохраняются на телефоне) ----------
+const cfg={hands:2,side:"any",cam:"user",mirror:true,swap:false,grace:300,gain:1};
+try{Object.assign(cfg,JSON.parse(localStorage.getItem("lh_cfg")||"{}"))}catch(e){}
+const save=()=>{try{localStorage.setItem("lh_cfg",JSON.stringify(cfg))}catch(e){}};
+
+function numHandsNeeded(){return(cfg.hands===2||cfg.side!=="any")?2:1}   // для выбора левой/правой нужно видеть обе
+function applyUI(){
+ $("m1").classList.toggle("on",cfg.hands===1);$("m2").classList.toggle("on",cfg.hands===2);
+ $("sideRow").style.display=cfg.hands===1?"block":"none";
+ $("sA").classList.toggle("on",cfg.side==="any");$("sL").classList.toggle("on",cfg.side==="L");$("sR").classList.toggle("on",cfg.side==="R");
+ $("cF").classList.toggle("on",cfg.cam==="user");$("cB").classList.toggle("on",cfg.cam==="environment");
+ $("mir").classList.toggle("on",cfg.mirror);$("mir").textContent="Зеркало: "+(cfg.mirror?"вкл":"выкл");
+ $("swap").classList.toggle("on",cfg.swap);$("swap").textContent="Лев/прав: "+(cfg.swap?"поменяны":"обычно");
+ const t=cfg.mirror?"scaleX(-1)":"none";video.style.transform=t;canvas.style.transform=t;
+ $("gain").value=cfg.gain;$("gainv").textContent=Number(cfg.gain).toFixed(1)+"×";
+ $("grace").value=cfg.grace;$("gracev").textContent=cfg.grace+" мс";
+ handsEl.textContent="Руки: 0 / "+cfg.hands;
+ if(landmarker)landmarker.setOptions({numHands:numHandsNeeded()}).catch(e=>console.error(e));
+}
+const set=(k,v)=>{cfg[k]=v;ghosts={};save();applyUI()};
+let ghosts={};
+$("m1").onclick=()=>set("hands",1);$("m2").onclick=()=>set("hands",2);
+$("sA").onclick=()=>set("side","any");$("sL").onclick=()=>set("side","L");$("sR").onclick=()=>set("side","R");
+$("mir").onclick=()=>set("mirror",!cfg.mirror);$("swap").onclick=()=>set("swap",!cfg.swap);
+$("gain").oninput=e=>{cfg.gain=parseFloat(e.target.value);$("gainv").textContent=cfg.gain.toFixed(1)+"×";save()};
+$("grace").oninput=e=>{cfg.grace=parseInt(e.target.value);$("gracev").textContent=cfg.grace+" мс";save()};
+function pickCam(c){
+ cfg.cam=c;cfg.mirror=(c==="user");   // у основной камеры зеркало по умолчанию выключено, можно переключить
+ cfg.swap=false;ghosts={};save();applyUI();
+ if(running)startCamera().catch(err=>{console.error(err);statusEl.textContent="Камера: "+(err.message||err)});
+}
+$("cF").onclick=()=>pickCam("user");$("cB").onclick=()=>pickCam("environment");
+applyUI();
+
+// ---------- освещение: яркость/контраст перед MediaPipe ----------
+const boost=document.createElement("canvas");boost.width=WIDTH;boost.height=HEIGHT;
+const bctx=boost.getContext("2d");
+
+// ---------- передача: WebSocket, запасной вариант HTTP ----------
+let ws=null,wsOpen=false,postBusy=false,lastPost=0,pingAt=0;
+function connectWS(){
+ const url=(location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/ws?role=camera";
+ ws=new WebSocket(url);
+ ws.onopen=()=>{wsOpen=true;serverEl.textContent="Сервер: WebSocket"};
+ ws.onclose=()=>{wsOpen=false;serverEl.textContent="Сервер: HTTP (запас)";setTimeout(connectWS,1000)};
+ ws.onerror=()=>{try{ws.close()}catch(e){}};
+ ws.onmessage=e=>{if(pingAt&&e.data.indexOf("pong")>=0){latEl.textContent="Пинг: "+Math.round(performance.now()-pingAt)+" мс";pingAt=0}};
+}
+setInterval(()=>{if(wsOpen&&!pingAt){pingAt=performance.now();ws.send('{"ping":true}')}},2000);
+async function postPose(data){
+ if(postBusy)return;postBusy=true;
+ try{await fetch("/pose",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data),cache:"no-store",keepalive:true})}
+ catch(e){serverEl.textContent="Сервер: ошибка"}finally{postBusy=false}
+}
+function send(hands,now){
+ if(!hands.length){ if(now-lastEmptySend<100)return; lastEmptySend=now; }
+ const data={hands};
+ if(wsOpen){ if(ws.bufferedAmount<16384)ws.send(JSON.stringify(data)); }
+ else if(now-lastPost>=34){lastPost=now;postPose(data)}
+}
+
+// ---------- распознавание ----------
+function processFrame(){
+ const now=performance.now();
+ let ts=now;if(ts<=lastTs)ts=lastTs+0.01;lastTs=ts;
+ let src=video;
+ if(cfg.gain>1.01){
+  bctx.filter="brightness("+cfg.gain+") contrast("+(1+(cfg.gain-1)*0.35)+")";
+  bctx.drawImage(video,0,0,WIDTH,HEIGHT);
+  src=boost;
+ }
+ const result=landmarker.detectForVideo(src,ts);
+ const landmarks=result.landmarks||[],handed=result.handedness||[];
+
+ // кандидаты с учётом «поменять левую/правую»
+ let cands=[];
+ for(let h=0;h<landmarks.length;h++){
+  const raw=handed[h]?.[0]?.categoryName||"Right";
+  const label=cfg.swap?(raw==="Left"?"Right":"Left"):raw;
+  cands.push({label,score:handed[h]?.[0]?.score||0,pts:landmarks[h]});
+ }
+ cands.sort((a,b)=>b.score-a.score);
+ const want=cfg.side==="L"?"Left":cfg.side==="R"?"Right":null;
+ if(cfg.hands===1){
+  if(want)cands=cands.filter(c=>c.label===want);
+  cands=cands.slice(0,1);
+ }else cands=cands.slice(0,2);
+
+ ctx.clearRect(0,0,WIDTH,HEIGHT);
+ const out=[];
+ if(cfg.hands===1)ghosts={};      // в режиме одной руки лишних «призраков» не держим
+ for(const c of cands){
+  const color=c.label==="Left"?"#ff8bcb":"#52d7ff";
+  ctx.strokeStyle=color;ctx.fillStyle="#ffffff";ctx.lineWidth=2;
+  for(const [a,b] of LINKS){ctx.beginPath();ctx.moveTo(c.pts[a].x*WIDTH,c.pts[a].y*HEIGHT);ctx.lineTo(c.pts[b].x*WIDTH,c.pts[b].y*HEIGHT);ctx.stroke()}
+  for(const p of c.pts){ctx.beginPath();ctx.arc(p.x*WIDTH,p.y*HEIGHT,2.7,0,Math.PI*2);ctx.fill()}
+  const hand={handedness:c.label,score:c.score,points:c.pts.map(p=>({x:cfg.mirror?1-p.x:p.x,y:p.y,z:p.z||0}))};
+  out.push(hand);ghosts[c.label]={hand,t:now};
+ }
+ const real=out.length;
+
+ // удержание: рука пропала на быстром движении - продолжаем слать её последнее положение
+ if(cfg.grace>0){
+  for(const label of ["Left","Right"]){
+   if(out.length>=cfg.hands)break;
+   if(out.some(o=>o.handedness===label))continue;
+   if(cfg.hands===1&&want&&label!==want)continue;
+   const g=ghosts[label];
+   if(!g||now-g.t>cfg.grace)continue;
+   const gw=g.hand.points[0];
+   if(out.some(o=>Math.hypot(o.points[0].x-gw.x,o.points[0].y-gw.y)<0.2))continue;  // это та же рука с другой меткой
+   out.push(g.hand);
+  }
+ }
+
+ send(out,now);
+ handsEl.textContent="Руки: "+out.length+" / "+cfg.hands;
+ statusEl.textContent=real?"Трекинг активен":(out.length?"Удерживаю руку…":"Покажи руки камере");
+ frames++;if(now-lastFps>=1000){fpsEl.textContent=frames+" FPS";frames=0;lastFps=now}
+}
+
+function startLoop(){
+ if("requestVideoFrameCallback" in HTMLVideoElement.prototype){
+  const cb=()=>{if(!running)return;try{processFrame()}catch(e){console.error(e)}video.requestVideoFrameCallback(cb)};
+  video.requestVideoFrameCallback(cb);
+ }else{
+  let lastT=-1;
+  const loop=()=>{if(!running)return;
+   if(video.readyState>=2&&video.currentTime!==lastT){lastT=video.currentTime;try{processFrame()}catch(e){console.error(e)}}
+   requestAnimationFrame(loop)};
+  requestAnimationFrame(loop);
+ }
+}
+
+async function startCamera(){
+ if(stream)stream.getTracks().forEach(t=>t.stop());
+ stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:cfg.cam},width:{ideal:WIDTH},height:{ideal:HEIGHT},frameRate:{ideal:60}}});
+ video.srcObject=stream;await video.play();
+}
+
+async function init(){
+ statusEl.textContent="Загрузка модели…";
+ const vision=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+ landmarker=await HandLandmarker.createFromOptions(vision,{
+  baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",delegate:"GPU"},
+  runningMode:"VIDEO",numHands:numHandsNeeded(),
+  minHandDetectionConfidence:.4,minHandPresenceConfidence:.4,minTrackingConfidence:.4   // ниже порог = рука реже теряется на быстром движении
+ });
+ await startCamera();canvas.width=WIDTH;canvas.height=HEIGHT;
+ running=true;statusEl.textContent="Ищу руки…";startLoop();
+}
+$("start").addEventListener("click",async e=>{
+ e.currentTarget.disabled=true;
+ try{await init();e.currentTarget.textContent="Трекер запущен"}
+ catch(err){console.error(err);statusEl.textContent="Ошибка: "+(err.message||err);e.currentTarget.disabled=false}
+});
+connectWS();
+</script></main></body></html>
